@@ -23,7 +23,7 @@ namespace ServerPlugin;
 // ReSharper disable once UnusedType.Global
 public class Plugin : IPlugin, ICommonPlugin
 {
-    public const string Name = "PluginTemplate";
+    public const string Name = "ErrorReporting";
     public static Plugin Instance { get; private set; }
 
     public long Tick { get; private set; }

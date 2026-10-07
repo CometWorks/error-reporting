@@ -1,9 +1,9 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Library</OutputType>
     <RootNamespace>ServerPlugin</RootNamespace>
-    <AssemblyName>PluginTemplate</AssemblyName>
+    <AssemblyName>ErrorReporting</AssemblyName>
     <LangVersion>14</LangVersion>
 
     <!-- Target platforms on Windows and Linux -->

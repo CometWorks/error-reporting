@@ -2,7 +2,7 @@
   <PropertyGroup>
     <OutputType>Library</OutputType>
     <RootNamespace>ClientPlugin</RootNamespace>
-    <AssemblyName>PluginTemplate</AssemblyName>
+    <AssemblyName>ErrorReporting</AssemblyName>
     <LangVersion>14</LangVersion>
 
     <!-- Target platforms on Windows and Linux -->
