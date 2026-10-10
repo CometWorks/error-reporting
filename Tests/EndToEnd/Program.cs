@@ -15,6 +15,9 @@ using Microsoft.Extensions.Logging.Abstractions;
 using PluginSdk.Logging;
 using Quasar.Diagnostics;
 using Quasar.Services;
+using Quasar.Services.Auth;
+using Quasar.Services.ServerList;
+using Magnetar.Protocol.Runtime;
 using ServerPlugin;
 using HostContract = Quasar.Host.Contract.V1;
 #if SERVER_LIST_CONTRACT
@@ -32,12 +35,13 @@ if (args is ["--emit-plugin", var emissionDirectory, var transfer])
     LogBatchCapture.Flush(emissionDirectory, Environment.GetEnvironmentVariable("ERROR_REPORTING_POLICY_FILE")!, force: true);
     return;
 }
-if (args.Length != 3) throw new ArgumentException("Usage: EndToEnd HOST_DLL BACKEND_DLL PRIVATE_WORK_DIRECTORY");
+if (args.Length is not (3 or 4)) throw new ArgumentException("Usage: EndToEnd HOST_DLL BACKEND_DLL PRIVATE_WORK_DIRECTORY [SERVER_LIST_DLL]");
 string root = Path.GetFullPath(args[2]);
 Directory.CreateDirectory(root); DiagnosticCollector.PrivateDirectory(root);
-int backendPort = Port();
+int backendPort = Port(), directoryPort = Port();
 using var consent = new DataHandlingConsentCatalog(NullLogger<DataHandlingConsentCatalog>.Instance, Path.Combine(root, "consent.json"));
-await consent.SaveAsync(false, true, true);
+// No network enrollment is permitted until diagnostic consent.
+
 var credentials = new ClusterCredentialStore(new EphemeralDataProtectionProvider(), Path.Combine(root, "credentials.json"));
 var hosts = new ClusterHostCatalog(credentials, Path.Combine(root, "hosts"));
 var fixtures = new List<HostFixture>();
@@ -57,11 +61,9 @@ Check(fixtures[0].Secret != fixtures[1].Secret, "Hosts have distinct random cred
 using var routing = new LoopbackHostHandler(fixtures.ToDictionary(f => f.Host.Id, f => f.Host.CommandPort));
 using var hostHttp = new HttpClient(routing) { Timeout = TimeSpan.FromSeconds(10) };
 var hostClient = new ClusterHostClient(hostHttp, credentials);
-string uplinkSecret = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
 var settings = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
 {
     ["Quasar:Diagnostics:BackofficeUrl"] = $"http://127.0.0.1:{backendPort}/",
-    ["Quasar:Diagnostics:UploadToken"] = uplinkSecret,
     ["Quasar:Diagnostics:StorageDirectory"] = Path.Combine(root, "large disk", "quasar"),
 }).Build();
 using var backofficeHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
@@ -69,66 +71,85 @@ var localCollector = new DiagnosticCollector(Path.Combine(root, "large disk", "q
 var quasarCapture = new QuasarDiagnosticLoggerProvider(localCollector, TimeProvider.System, subscribe: false);
 using var captureLoggers = LoggerFactory.Create(builder => builder.SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Trace).AddProvider(quasarCapture));
 using var uplink = new DiagnosticsUplinkService(consent, hosts, hostClient, backofficeHttp, settings,
-    captureLoggers.CreateLogger<DiagnosticsUplinkService>(), Path.Combine(root, "quasar"), localCollector);
+    captureLoggers.CreateLogger<DiagnosticsUplinkService>(), Path.Combine(root, "quasar", "Diagnostics"), localCollector);
 Check(uplink.SpoolDirectory == Path.Combine(root, "large disk", "quasar", "outbound")
-    && File.Exists(Path.Combine(root, "quasar", "installation-id")), "Quasar bulk queue uses its custom path while identity stays in stable state");
+    && File.Exists(Path.Combine(root, "quasar", "Diagnostics", "installation-id")), "Quasar bulk queue uses its custom path while identity stays in stable state");
 string keyDirectory = Path.Combine(root, "keys"); await KeyRing.GenerateAsync(keyDirectory);
 using var keys = new KeyRing(keyDirectory);
-string listingVerifier = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
 Process StartBackend() => Launch(args[1], [], new()
 {
     ["ASPNETCORE_URLS"] = $"http://127.0.0.1:{backendPort}",
     ["Diagnostics__DataDirectory"] = Path.Combine(root, "backend"), ["Diagnostics__KeyDirectory"] = keyDirectory,
     ["Diagnostics__GitHubClientId"] = "fixture-unused", ["Diagnostics__GitHubClientSecret"] = "fixture-unused",
-    ["Diagnostics__Installations__" + uplink.InstallationId] = uplinkSecret,
-    ["Diagnostics__ListingVerifierToken"] = listingVerifier,
+    ["Diagnostics__DirectoryUrl"] = $"http://127.0.0.1:{directoryPort}/",
     ["Diagnostics__Analysis__Enabled"] = "false", ["Diagnostics__Analysis__PublishIssues"] = "false",
 });
 void StartHost(HostFixture fixture) => fixture.Process = Launch(args[0], ["run", "--config", fixture.ConfigPath], new()
     { ["DIAGNOSTIC_FIXTURE_HOST_TOKEN"] = fixture.Secret });
-Process? backend = null;
+Process? backend = null, directory = null;
+#if SERVER_LIST_CONTRACT
+if (args.Length != 4) throw new ArgumentException("Pass SERVER_LIST_DLL when building with ServerListRepo.");
+var cache = typeof(MagnetarPaths).GetField("_cachedQuasarDirectory", BindingFlags.NonPublic | BindingFlags.Static)!;
+cache.SetValue(null, Path.Combine(root, "quasar"));
+using var rbac = new RbacConfigCatalog(NullLogger<RbacConfigCatalog>.Instance);
+await rbac.SaveAsync(new() { SubjectRoleMappings = [new() { Provider = QuasarAuthSchemes.Steam,
+    Subject = "76561198000000001", Roles = [QuasarRoles.Admin] }] });
+string listingId = Guid.NewGuid().ToString("N");
+using var publisher = new ServerListPublisher(new() { Enabled = true }, consent, rbac, backofficeHttp,
+    _ => Task.FromResult<IReadOnlyList<ServerListListing>>([new(listingId, "Diagnostic fixture", "play.example.org", 27016,
+        DateTimeOffset.UtcNow, true, 0, 16, 1f)]), Path.Combine(root, "quasar"), NullLogger<ServerListPublisher>.Instance, uplink);
+using var directoryHttp = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{directoryPort}"), Timeout = TimeSpan.FromSeconds(5) };
+async Task<bool> Visible()
+{ using var response = JsonDocument.Parse(await directoryHttp.GetStringAsync("/api/servers")); return response.RootElement.GetArrayLength() == 1; }
+#endif
 try
 {
+#if SERVER_LIST_CONTRACT
+    directory = Launch(args[3], [], new()
+    {
+        ["ASPNETCORE_ENVIRONMENT"] = "Development", ["ASPNETCORE_URLS"] = $"http://127.0.0.1:{directoryPort}",
+        ["Directory__PublicUrl"] = $"http://127.0.0.1:{directoryPort}", ["Directory__DataDirectory"] = Path.Combine(root, "directory"),
+        ["Directory__DiagnosticsUrl"] = $"http://127.0.0.1:{backendPort}",
+    });
+    await Ready($"http://127.0.0.1:{directoryPort}/health");
+#endif
     backend = StartBackend();
     foreach (var fixture in fixtures) StartHost(fixture);
     await Ready($"http://127.0.0.1:{backendPort}/health");
     foreach (var fixture in fixtures) await HostReady(fixture);
     await uplink.PollOnceAsync(default);
+    Check(!File.Exists(Path.Combine(uplink.StateDirectory, "machine-key.pem")), "consent-off Quasar never enrolls");
+    await consent.SaveAsync(true, true, true);
+    await uplink.PollOnceAsync(default);
+    await consent.SaveAsync(false); // Disable statistics independently after the fresh YES enrollment.
+    Check(File.Exists(Path.Combine(uplink.StateDirectory, "machine-key.pem")), "automatic Quasar enrollment needs no configured ID/token");
     // The normal uplink debug log is consent-gated and naturally batched. No synthetic heartbeat or crash is needed.
     await Task.Delay(TimeSpan.FromSeconds(31));
     await uplink.PollOnceAsync(default);
-    async Task<HttpResponseMessage> VerifyDelivery(string auth, long generation)
+    async Task<HttpResponseMessage> VerifyDelivery(long generation)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Get,
-            $"http://127.0.0.1:{backendPort}/v1/listing-availability/{uplink.InstallationId}?generation={generation}");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", auth);
+        using var request = await uplink.CreateListingRequestAsync(HttpMethod.Get, "v1/quasar/challenge", default)
+            ?? throw new InvalidOperationException("Missing negotiated credential.");
+        request.Headers.Add("X-Diagnostics-Generation", generation.ToString());
         return await backofficeHttp.SendAsync(request);
     }
-    using (var receipt = await VerifyDelivery(listingVerifier, consent.GetSettings().Generation))
-    {
-        var availability = JsonSerializer.Deserialize<ListingAvailability>(await receipt.Content.ReadAsStringAsync(),
-            new JsonSerializerOptions(JsonSerializerDefaults.Web));
-        Check(receipt.IsSuccessStatusCode && availability?.InstallationId == uplink.InstallationId,
-            "quiet Quasar's real uplink log grants fresh decryptable delivery attestation");
-    }
-    using (var denied = await VerifyDelivery(uplinkSecret, consent.GetSettings().Generation))
-        Check(denied.StatusCode == HttpStatusCode.Unauthorized, "Quasar upload secret cannot act as website verifier");
+    using (var receipt = await VerifyDelivery(consent.GetSettings().Generation))
+        Check(receipt.IsSuccessStatusCode, "quiet Quasar's actual encrypted logs grant delivery eligibility");
 #if SERVER_LIST_CONTRACT
-    var directorySettings = new SiteSettings { DataDirectory = Path.Combine(root, "directory"),
-        DiagnosticsUrl = $"http://127.0.0.1:{backendPort}", DiagnosticsVerifierToken = listingVerifier };
-    var directoryStore = new DirectoryStore(directorySettings, TimeProvider.System);
-    var (_, listingId) = directoryStore.Enroll(uplink.InstallationId);
-    using var verifierHttp = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
-    var directoryService = new DirectoryService(directoryStore,
-        new DiagnosticsVerifier(verifierHttp, directorySettings, TimeProvider.System), TimeProvider.System);
-    var challenge = await directoryService.ChallengeAsync(uplink.InstallationId, consent.GetSettings().Generation, default);
-    await directoryService.PublishAsync(uplink.InstallationId, new Publication(1, uplink.InstallationId, 1, 1,
-        consent.GetSettings().Generation, DateTimeOffset.UtcNow.AddMinutes(-1).ToString("O"), challenge.Nonce,
-        [new("Steam", "76561198000000001")], [new(listingId, "Diagnostic fixture", "play.example.org", 27016,
-            DateTimeOffset.UtcNow, true, 0, 16, 1f)]), default);
-    Check((await directoryService.BrowseAsync(default)).Single().Id == listingId
-        && await directoryService.JoinAsync(listingId, default) == "steam://connect/play.example.org:27016",
-        "real server-list consumer accepts backend receipt and permits linked listing/join");
+    await publisher.PublishOnceAsync(default);
+    Check(!await Visible(), "diagnostic consent alone does not list a community server");
+    await consent.SaveListingVisibilityAsync(true);
+    Check(consent.GetSettings().ConsentGranted == false, "listing opt-in does not grant statistics sharing");
+    await publisher.PublishOnceAsync(default);
+    await Until(Visible, "Signed backoffice update did not activate listing");
+    Check((await directoryHttp.GetStringAsync($"/api/servers/{listingId}/join")).Contains("steam://connect/play.example.org:27016"),
+        "real website accepts signed service update and permits join without consuming a field proof");
+    await consent.SaveListingVisibilityAsync(false);
+    await publisher.PublishOnceAsync(default);
+    await Until(async () => !await Visible(), "Visibility withdrawal did not push");
+    Check(consent.GetSettings().DiagnosticsGranted, "visibility-only withdrawal preserves diagnostic reporting");
+    await consent.SaveListingVisibilityAsync(true); await publisher.PublishOnceAsync(default);
+    await Until(Visible, "Listing did not recover after visibility opt-in");
 #endif
     foreach (var fixture in fixtures)
         Check(fixture.Collector().CurrentPolicy is not null,
@@ -143,7 +164,8 @@ try
     // Both real Hosts continue collecting while the backoffice is down. Quasar must durably own each retry.
     await Stop(backend); backend.Dispose(); backend = null;
 #if SERVER_LIST_CONTRACT
-    Check((await directoryService.BrowseAsync(default)).Length == 0, "backoffice outage hides listing on the next directory request");
+    await Task.Delay(TimeSpan.FromSeconds(61));
+    Check(!await Visible(), "backoffice outage expires the website local lease without evidence queries");
 #endif
     var emitted = new Dictionary<string, string>();
     var batches = new Dictionary<string, string>();
@@ -169,8 +191,20 @@ try
     }
     backend = StartBackend(); await Ready($"http://127.0.0.1:{backendPort}/health");
     await Until(async () => { await uplink.PollOnceAsync(default); return emitted.Values.Concat(batches.Values).All(id => File.Exists(RecordPath(id))); }, "Backoffice retry did not recover");
-    using (var available = await VerifyDelivery(listingVerifier, consent.GetSettings().Generation))
+    using (var available = await VerifyDelivery(consent.GetSettings().Generation))
         Check(available.IsSuccessStatusCode, "newer reports from both Hosts preserve Quasar listing attestation");
+    using (var restartedUplink = new DiagnosticsUplinkService(consent, hosts, hostClient, backofficeHttp, settings,
+        captureLoggers.CreateLogger<DiagnosticsUplinkService>(), uplink.StateDirectory, localCollector))
+    {
+        await restartedUplink.PollOnceAsync(default);
+        Check(restartedUplink.InstallationId == uplink.InstallationId && restartedUplink.CurrentPolicy is not null,
+            "Quasar restart re-enrolls automatically with its persisted machine key");
+    }
+#if SERVER_LIST_CONTRACT
+    await publisher.PublishOnceAsync(default);
+    await Until(Visible, "Listing did not recover after backend restart");
+    Check(await Visible(), "backend restart preserves enrollment and advances signed feed epoch");
+#endif
     foreach (var fixture in fixtures)
     {
         string id = emitted[fixture.Host.Id];
@@ -228,11 +262,12 @@ try
     await Stop(secondHost.Process!); secondHost.Process!.Dispose(); secondHost.Process = null;
     await consent.SaveAsync(false, false, false);
     await uplink.PollOnceAsync(default);
-    using (var withdrawn = await VerifyDelivery(listingVerifier, consent.GetSettings().Generation))
-        Check(withdrawn.StatusCode == HttpStatusCode.NotFound, "withdrawn consent generation cannot use earlier logging evidence");
+    using (var withdrawn = await VerifyDelivery(consent.GetSettings().Generation))
+        Check(withdrawn.StatusCode == HttpStatusCode.Forbidden, "withdrawn consent generation cannot use earlier logging evidence");
 #if SERVER_LIST_CONTRACT
-    directoryStore.Withdraw(new Withdrawal(1, uplink.InstallationId, 1, 2));
-    Check((await directoryService.BrowseAsync(default)).Length == 0, "directory withdrawal hides previously attested listing");
+    await publisher.PublishOnceAsync(default);
+    await Until(async () => !await Visible(), "Consent withdrawal did not hide listing");
+    Check(!await Visible(), "diagnostic withdrawal pushes website visibility removal");
 #endif
     Check(!File.Exists(RecordPath(revokedId)) && Directory.GetFiles(uplink.SpoolDirectory).Length == 0,
         "offline Host report is not uploaded after revocation");
@@ -256,6 +291,7 @@ catch (Exception exception)
 }
 finally
 {
+    if (directory is not null) { await Stop(directory); directory.Dispose(); }
     foreach (var fixture in fixtures) if (fixture.Process is { } process) { await Stop(process); process.Dispose(); }
     if (backend is not null) { await Stop(backend); backend.Dispose(); }
 }
