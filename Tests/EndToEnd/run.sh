@@ -13,7 +13,12 @@ artifacts_directory="$(cd -- "$4" && pwd)"
 repo_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 project="$repo_directory/Tests/EndToEnd/EndToEnd.csproj"
 project_args=(-p:QuasarRepo="$quasar_directory" -p:BackendRepo="$backend_directory")
-if [[ $# == 5 ]]; then project_args+=(-p:ServerListRepo="$(cd -- "$5" && pwd)"); fi
+runtime_args=()
+if [[ $# == 5 ]]; then
+  site_directory="$(cd -- "$5" && pwd)"
+  project_args+=(-p:ServerListRepo="$site_directory")
+  runtime_args+=("$site_directory/Server/bin/Debug/net10.0/Server.dll")
+fi
 if [[ "${DIAGNOSTICS_SKIP_PACKAGE_BUILD:-0}" != 1 ]]; then
   "$quasar_directory/scripts/bootstrap-diagnostics.sh" "$repo_directory/Diagnostics/CometWorks.Diagnostics.csproj"
 fi
@@ -28,4 +33,4 @@ dotnet build "$quasar_directory/Quasar.Host/Quasar.Host.csproj" --configfile "$q
 echo 'END-TO-END BUILD COMPLETE; starting isolated runtime fixtures.'
 dotnet "$repo_directory/Tests/EndToEnd/bin/Debug/net10.0/Quasar.Tests.dll" \
   "$quasar_directory/Quasar.Host/bin/Debug/net10.0/Quasar.Host.dll" \
-  "$backend_directory/Backend/bin/Debug/net10.0/Backend.dll" "$artifacts_directory/run-$(date -u +%Y%m%dT%H%M%S)-$$"
+  "$backend_directory/Backend/bin/Debug/net10.0/Backend.dll" "$artifacts_directory/run-$(date -u +%Y%m%dT%H%M%S)-$$" "${runtime_args[@]}"
