@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Version>0.1.0</Version>
+    <PackageId>CometWorks.Diagnostics</PackageId>
+    <Description>Versioned encrypted diagnostics archive protocol for CometWorks.</Description>
+    <Authors>CometWorks</Authors>
+    <LicenseExpression>MIT</LicenseExpression>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\ServerPlugin\LogBatchCapture.cs" Link="LogBatchCapture.cs" />
+    <!-- System.IO.Compression cannot create password-encrypted ZIP archives. -->
+    <PackageReference Include="SharpZipLib" Version="1.4.2" />
+  </ItemGroup>
+</Project>
