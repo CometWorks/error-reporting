@@ -70,9 +70,9 @@ internal static class IncidentCapture
 
     private static void OnUnhandled(object sender, UnhandledExceptionEventArgs args)
     {
-        LogBatchCapture.Flush(directory, policyPath, force: true);
         Capture("Magnetar", "unhandled_exception", "Critical", "Unhandled process exception",
             args.ExceptionObject as Exception, null, fatal: true);
+        LogBatchCapture.Flush(directory, policyPath, force: true);
         // Do not exit or mark anything handled: the runtime owns termination and dump generation.
     }
 

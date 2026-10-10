@@ -1,10 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace CometWorks.Diagnostics;
 
@@ -15,51 +17,129 @@ public static class LogBatchCapture
     private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true };
     private const int MessageLimit = 7680;
 
+    private sealed class Work
+    {
+        public string Directory, PolicyPath, Source, Severity, Message;
+        public DateTimeOffset At;
+        public long Generation;
+        public bool Force;
+        public TaskCompletionSource<bool> Completion;
+    }
+
+    private static readonly BlockingCollection<Work> Queue = new(1024);
+    private static readonly Lazy<Task> Writer = new(() => Task.Factory.StartNew(WriteLoop,
+        CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default));
+
     public static void Append(string directory, string policyPath, string source, string severity, string message)
     {
-        if (string.IsNullOrEmpty(directory) || !Monitor.TryEnter(Gate)) return;
+        if (string.IsNullOrEmpty(directory) || Queue.Count >= 1024) return;
         try
         {
-            if (ReadPolicy(policyPath, DateTimeOffset.UtcNow) == null
-                && !File.Exists(Path.Combine(directory, "log-batch.pending"))) return;
-            using (var lease = Lock(directory))
+            var at = DateTimeOffset.UtcNow;
+            // Bind admission to the actual consent generation, before asynchronous work.
+            // This small read cannot be deferred: a queued line must never move into a later opt-in.
+            var policy = ReadPolicy(policyPath, at);
+            if (policy == null)
             {
-                var now = DateTimeOffset.UtcNow;
-                var policy = ReadPolicy(policyPath, now);
-                string pendingPath = Path.Combine(directory, "log-batch.pending");
-                if (policy == null) { File.Delete(pendingPath); return; }
-                var pending = ReadPending(pendingPath, policy);
-                string line = JsonSerializer.Serialize(new { atUtc = now, source = Limit(source, 128),
-                    severity = Limit(severity, 32), message = Limit(message, 512) }, Json) + "\n";
+                if (File.Exists(Path.Combine(directory, "log-batch.pending")) && Queue.TryAdd(new Work
+                    { Directory = directory, PolicyPath = policyPath, Completion = new TaskCompletionSource<bool>() }))
+                    _ = Writer.Value;
+                return;
+            }
+            if (Queue.TryAdd(new Work { Directory = directory, PolicyPath = policyPath, At = at,
+                Generation = policy.Generation, Source = Limit(source, 128), Severity = Limit(severity, 32),
+                Message = Limit(message, 512) })) _ = Writer.Value;
+        }
+        catch { /* Never recurse into application logging or interrupt its caller. */ }
+    }
+
+    public static void Flush(string directory, string policyPath, bool force = false)
+    {
+        if (string.IsNullOrEmpty(directory)) return;
+        try
+        {
+            var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!Queue.TryAdd(new Work { Directory = directory, PolicyPath = policyPath, Force = force,
+                Completion = completion })) return;
+            _ = Writer.Value;
+            // Explicit collector/shutdown flushes may wait; ordinary SDK calls never wait on persistence.
+            completion.Task.Wait(TimeSpan.FromSeconds(5));
+        }
+        catch { }
+    }
+
+    private static void WriteLoop()
+    {
+        foreach (var first in Queue.GetConsumingEnumerable())
+        {
+            var work = new List<Work> { first };
+            if (first.Completion == null)
+            {
+                var until = DateTime.UtcNow.AddMilliseconds(100);
+                Work next;
+                while (work.Count < 64 && Queue.TryTake(out next,
+                    Math.Max(0, (int)(until - DateTime.UtcNow).TotalMilliseconds)))
+                {
+                    work.Add(next);
+                    if (next.Completion != null) break;
+                }
+            }
+            foreach (var group in work.Where(w => w.Completion == null).GroupBy(w => new { w.Directory, w.PolicyPath }))
+            {
+                try { AppendBatch(group.Key.Directory, group.Key.PolicyPath, group); }
+                catch { /* A full disk or another process's writer cannot fault the capture worker. */ }
+            }
+            foreach (var flush in work.Where(w => w.Completion != null))
+            {
+                try { FlushCore(flush.Directory, flush.PolicyPath, flush.Force); }
+                catch { }
+                finally { flush.Completion.TrySetResult(true); }
+            }
+        }
+    }
+
+    private static void AppendBatch(string directory, string policyPath, IEnumerable<Work> work)
+    {
+        lock (Gate)
+        using (var lease = Lock(directory))
+        {
+            var policy = ReadPolicy(policyPath, DateTimeOffset.UtcNow);
+            string pendingPath = Path.Combine(directory, "log-batch.pending");
+            if (policy == null) { File.Delete(pendingPath); return; }
+            var pending = ReadPending(pendingPath, policy);
+            foreach (var item in work)
+            {
+                if (item.Generation != policy.Generation || item.At < policy.GrantedSinceUtc) continue;
+                string line = JsonSerializer.Serialize(new { atUtc = item.At, source = item.Source,
+                    severity = item.Severity, message = item.Message }, Json) + "\n";
                 if (pending != null && (pending.Message.Length + line.Length > MessageLimit
-                    || Count(pending) >= 64 || now - pending.CapturedAtUtc >= TimeSpan.FromSeconds(30)))
+                    || Count(pending) >= 64 || item.At - pending.CapturedAtUtc >= TimeSpan.FromSeconds(30)))
                 {
                     Publish(directory, pendingPath, pending, policyPath);
                     pending = null;
                 }
                 pending = pending ?? new Batch
                 {
-                    ReportId = Guid.NewGuid().ToString("N"), CapturedAtUtc = now,
+                    ReportId = Guid.NewGuid().ToString("N"), CapturedAtUtc = item.At,
                     Context = new Dictionary<string, string>
                     {
                         ["captureConsentGeneration"] = policy.Generation.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                        ["batchStartedAtUtc"] = now.ToString("O"), ["lineCount"] = "0"
+                        ["batchStartedAtUtc"] = item.At.ToString("O"), ["lineCount"] = "0"
                     }
                 };
                 pending.Message += line;
                 pending.Context["lineCount"] = (Count(pending) + 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
-                pending.Context["batchEndedAtUtc"] = now.ToString("O");
-                Write(pendingPath, pending, replace: true);
+                pending.Context["batchEndedAtUtc"] = item.At.ToString("O");
             }
+            if (pending != null && Eligible(pending, ReadPolicy(policyPath, DateTimeOffset.UtcNow)))
+                Write(pendingPath, pending, replace: true);
+            else File.Delete(pendingPath);
         }
-        catch { /* Never recurse into application logging or interrupt its caller. */ }
-        finally { Monitor.Exit(Gate); }
     }
 
-    public static void Flush(string directory, string policyPath, bool force = false)
+    private static void FlushCore(string directory, string policyPath, bool force)
     {
-        if (string.IsNullOrEmpty(directory) || !Monitor.TryEnter(Gate)) return;
-        try
+        lock (Gate)
         {
             if (ReadPolicy(policyPath, DateTimeOffset.UtcNow) == null
                 && !File.Exists(Path.Combine(directory, "log-batch.pending"))) return;
@@ -73,8 +153,6 @@ public static class LogBatchCapture
                     Publish(directory, path, pending, policyPath);
             }
         }
-        catch { }
-        finally { Monitor.Exit(Gate); }
     }
 
     private static FileStream Lock(string directory) => new FileStream(Path.Combine(directory, ".log-batch.lock"),

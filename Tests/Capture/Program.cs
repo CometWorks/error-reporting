@@ -51,6 +51,7 @@ static void CheckLogBatches(string root)
     SetPolicy(1, false); Append("before consent"); Flush();
     if (Directory.GetFiles(run).Length != 0) throw new Exception("Disabled log collection wrote files");
     SetPolicy(1, true); Append("first permitted"); Append("second permitted");
+    CometWorks.Diagnostics.LogBatchCapture.Flush(run, policy);
     if (!File.Exists(Path.Combine(run, "log-batch.pending"))) throw new Exception("Pending batch was not durable");
     CometWorks.Diagnostics.LogBatchCapture.Flush(run, policy);
     if (Directory.GetFiles(run, "log-*.json").Length != 0) throw new Exception("Polling published a premature tiny batch");
@@ -76,7 +77,30 @@ static void CheckLogBatches(string root)
             throw new Exception("Old consent generation was published");
     Append("expired pending"); SetPolicy(4, true, DateTimeOffset.UtcNow.AddSeconds(-1)); Flush();
     if (File.Exists(Path.Combine(run, "log-batch.pending"))) throw new Exception("Expired lease retained pending batch");
-    SetPolicy(5, true);
+    // Block the background writer, then change consent before its queued line can be persisted.
+    var writerGate = typeof(CometWorks.Diagnostics.LogBatchCapture).GetField("Gate",
+        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!.GetValue(null)!;
+    lock (writerGate)
+    {
+        SetPolicy(5, true); Append("queued before generation changes");
+        if (File.Exists(Path.Combine(run, "log-batch.pending"))) throw new Exception("Admission performed persistence on its caller");
+        SetPolicy(6, true);
+    }
+    Flush();
+    if (Directory.GetFiles(run, "log-*.json").Any(p => File.ReadAllText(p).Contains("queued before generation changes")))
+        throw new Exception("Queued records crossed consent generations");
+    SetPolicy(7, true);
+    lock (writerGate)
+        for (int n = 0; n < 1000; n++) Append("bounded background capture");
+    Flush();
+    int lines = 0;
+    foreach (string path in Directory.GetFiles(run, "log-*.json"))
+    {
+        using var batchDocument = JsonDocument.Parse(File.ReadAllText(path));
+        if (batchDocument.RootElement.GetProperty("message").GetString()!.Contains("bounded background capture"))
+            lines += int.Parse(batchDocument.RootElement.GetProperty("context").GetProperty("lineCount").GetString()!);
+    }
+    if (lines != 1000) throw new Exception("Background capture did not drain all admitted lines");
     File.WriteAllText(Path.Combine(run, "run.json"), "trusted");
     string fatal = Path.Combine(run, Guid.NewGuid().ToString("N") + ".json"); File.WriteAllText(fatal, "fatal");
     for (int n = 0; n < 40; n++) { Append(new string('x', 10000)); Flush(); }
