@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Library</OutputType>
@@ -371,5 +371,9 @@
              Text="Deployed the $(TargetFramework) server build to &quot;$(PluginDirectory)&quot;" />
   </Target>
 
-  <Import Project="..\Shared\Shared.projitems" Label="Shared" />
+  <!-- Server capture needs no example patches or client configuration. -->
+  <ItemGroup>
+    <Compile Remove="Patches/**/*.cs" />
+    <PackageReference Include="System.Text.Json" Version="8.0.5" Condition="'$(TargetFramework)' == 'net48'" />
+  </ItemGroup>
 </Project>

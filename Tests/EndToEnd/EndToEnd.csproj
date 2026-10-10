@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework><OutputType>Exe</OutputType><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
+    <!-- Access the same internal seams as Quasar's existing focused tests. -->
+    <AssemblyName>Quasar.Tests</AssemblyName>
+    <DefineConstants Condition="'$(ServerListRepo)' != ''">$(DefineConstants);SERVER_LIST_CONTRACT</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(QuasarRepo)/Quasar/Quasar.csproj" />
+    <ProjectReference Include="$(BackendRepo)/Backend/Backend.csproj" />
+    <ProjectReference Include="$(ServerListRepo)/Server/Server.csproj" Condition="'$(ServerListRepo)' != ''" />
+    <Compile Include="../../ServerPlugin/IncidentCapture.cs" Link="IncidentCapture.cs" />
+    <Reference Include="PluginSdk" HintPath="$(MagnetarBin)/PluginSdk.dll" />
+  </ItemGroup>
+  <Target Name="CheckIntegrationPaths" BeforeTargets="PrepareForBuild">
+    <Error Condition="'$(QuasarRepo)' == '' or '$(BackendRepo)' == ''" Text="Pass absolute QuasarRepo and BackendRepo checkout paths." />
+  </Target>
+</Project>
