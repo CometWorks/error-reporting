@@ -23,6 +23,16 @@ at 8/32 KiB. Concurrent writers may drop incidents instead of blocking a game th
 capture waits at most 100 ms for the writer lock. Local I/O failures are isolated. Quasar.Host
 collects these files, and Quasar separately controls external sharing and dump consent.
 
+## Platforms
+
+The server plugin runs wherever Magnetar runs: on Windows, on Linux, and with the Windows
+launchers under Proton or Wine, which Magnetar reports as platform `Proton`. There it needs
+a real runtime in the prefix, .NET 10 for MagnetarInterim or .NET Framework 4.8 for
+MagnetarLegacy. On Wine Mono the plugin does not compile (CS1705, System.Text.Json against
+Mono's System.Memory), and MagnetarLegacy refuses to start on Mono. The MagnetarHub entry
+lists `<Runtimes>CLR,CoreCLR</Runtimes>` and `<Platforms>Windows,Linux,Proton</Platforms>`,
+as `ErrorReportingServer.xml` does.
+
 Build against a Magnetar PluginSdk exposing `Logger.EntryEmitted`. The capture self-check runs with:
 
 ```sh
