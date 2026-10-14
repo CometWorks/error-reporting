@@ -10,5 +10,7 @@
         <Directory>ServerPlugin</Directory>
         <Directory>Shared</Directory>
     </SourceDirectories>
+    <Runtimes>CLR,CoreCLR</Runtimes>
+    <Platforms>Windows,Linux,Proton</Platforms>
     <Commit>TODO</Commit>
 </PluginData>
