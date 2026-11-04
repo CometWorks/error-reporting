@@ -4,8 +4,8 @@ using VRage.Plugins;
 
 #if !LOCAL_BUILD
 using System.Reflection;
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]
 #endif
 
 namespace ServerPlugin;
